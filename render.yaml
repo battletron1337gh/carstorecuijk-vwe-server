@@ -1,0 +1,24 @@
+# Render.com Blueprint
+# Dit bestand maakt deploy op Render super makkelijk
+# Zie: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: carstorecuijk-vwe
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GITHUB_REPO
+        value: battletron1337gh/CarStoreCuijk
+      - key: GITHUB_BRANCH
+        value: main
+      - key: GITHUB_TOKEN
+        sync: false  # Moet handmatig ingesteld worden in Render dashboard
+    disk:
+      name: data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1

@@ -1,0 +1,25 @@
+{
+  "name": "carstorecuijk-vwe-server",
+  "version": "1.0.0",
+  "description": "VWE Webhook Server voor Car Store Cuijk - Ontvangt voertuig updates en commit naar GitHub",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["vwe", "webhook", "carstore", "autodata"],
+  "author": "Car Store Cuijk",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "xml2js": "^0.6.2",
+    "axios": "^1.6.2",
+    "simple-git": "^3.21.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

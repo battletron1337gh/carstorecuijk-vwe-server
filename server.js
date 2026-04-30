@@ -1,0 +1,411 @@
+/**
+ * VWE Webhook Server voor Car Store Cuijk
+ * 
+ * Ontvangt voertuig data van VWE en commit updates naar GitHub
+ * Deploy: Render.com (gratis tier)
+ */
+
+const express = require('express');
+const xml2js = require('xml2js');
+const axios = require('axios');
+const fs = require('fs').promises;
+const path = require('path');
+const simpleGit = require('simple-git');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Configuratie
+const CONFIG = {
+  GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  GITHUB_REPO: process.env.GITHUB_REPO || 'battletron1337gh/CarStoreCuijk',
+  GITHUB_BRANCH: process.env.GITHUB_BRANCH || 'main',
+  DATA_DIR: process.env.DATA_DIR || './data',
+  REPO_DIR: process.env.REPO_DIR || './repo',
+  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || null
+};
+
+// Middleware
+app.use(express.raw({ type: 'application/xml', limit: '10mb' }));
+app.use(express.text({ type: 'text/xml', limit: '10mb' }));
+app.use(express.json());
+
+// Logging middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'VWE Webhook Server',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Health check voor monitoring
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// XML Parser
+const xmlParser = new xml2js.Parser({ explicitArray: false, mergeAttrs: true });
+
+/**
+ * Parse VWE XML naar JSON object
+ */
+async function parseVWEXml(xmlData) {
+  try {
+    const result = await xmlParser.parseStringPromise(xmlData);
+    return result;
+  } catch (error) {
+    console.error('XML Parse Error:', error.message);
+    throw new Error('Invalid XML format');
+  }
+}
+
+/**
+ * Haal voertuig data uit VWE XML
+ */
+function extractVehicleData(parsedXml) {
+  // VWE formaat kan variëren, dit zijn veelvoorkomende paden
+  const voertuig = parsedXml.voertuig || parsedXml.Voertuig || parsedXml.vehicle || parsedXml.Vehicle;
+  
+  if (!voertuig) {
+    // Probeer andere mogelijke structuren
+    const root = Object.values(parsedXml)[0];
+    if (root && typeof root === 'object') {
+      return normalizeVehicleData(root);
+    }
+    throw new Error('Geen voertuig data gevonden in XML');
+  }
+  
+  return normalizeVehicleData(voertuig);
+}
+
+/**
+ * Normaliseer voertuig data naar consistent formaat
+ */
+function normalizeVehicleData(data) {
+  return {
+    id: data.id || data.ID || data.voertuigId || data.kenteken || `vehicle_${Date.now()}`,
+    kenteken: data.kenteken || data.kenteken || data.licensePlate || data.license_plate || '',
+    merk: data.merk || data.make || data.Merk || '',
+    model: data.model || data.Model || data.type || data.Type || '',
+    bouwjaar: data.bouwjaar || data.year || data.Bouwjaar || data.productiejaar || '',
+    prijs: data.prijs || data.price || data.Prijs || data.verkoopprijs || '',
+    kmStand: data.kmStand || data.kilometerstand || data.mileage || data.KmStand || '',
+    brandstof: data.brandstof || data.fuel || data.Brandstof || '',
+    transmissie: data.transmissie || data.transmission || data.Transmissie || '',
+    kleur: data.kleur || data.color || data.Kleur || '',
+    fotoUrls: extractPhotoUrls(data),
+    actie: data.actie || data.action || data.Actie || 'add',
+    timestamp: new Date().toISOString(),
+    raw: data
+  };
+}
+
+/**
+ * Extract foto URLs uit voertuig data
+ */
+function extractPhotoUrls(data) {
+  const urls = [];
+  
+  // Verschillende mogelijke foto velden
+  const fotoFields = ['foto', 'fotos', 'photo', 'photos', 'afbeelding', 'afbeeldingen', 'image', 'images'];
+  
+  for (const field of fotoFields) {
+    if (data[field]) {
+      const fotos = Array.isArray(data[field]) ? data[field] : [data[field]];
+      fotos.forEach(foto => {
+        if (typeof foto === 'string' && foto.match(/^https?:\/\//)) {
+          urls.push(foto);
+        } else if (foto.url || foto.Url || foto.URL) {
+          urls.push(foto.url || foto.Url || foto.URL);
+        }
+      });
+    }
+  }
+  
+  return urls;
+}
+
+/**
+ * Sla voertuig op in JSON database
+ */
+async function saveVehicle(vehicleData) {
+  const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
+  
+  try {
+    // Zorg dat data directory bestaat
+    await fs.mkdir(CONFIG.DATA_DIR, { recursive: true });
+    
+    // Lees bestaande database
+    let db = { vehicles: [] };
+    try {
+      const existing = await fs.readFile(dbPath, 'utf8');
+      db = JSON.parse(existing);
+    } catch (e) {
+      // Bestand bestaat nog niet, start met lege database
+    }
+    
+    // Update of voeg toe
+    const existingIndex = db.vehicles.findIndex(v => v.id === vehicleData.id || v.kenteken === vehicleData.kenteken);
+    
+    if (existingIndex >= 0) {
+      if (vehicleData.actie === 'delete') {
+        db.vehicles.splice(existingIndex, 1);
+        console.log(`Voertuig verwijderd: ${vehicleData.id}`);
+      } else {
+        db.vehicles[existingIndex] = { ...db.vehicles[existingIndex], ...vehicleData };
+        console.log(`Voertuig geupdate: ${vehicleData.id}`);
+      }
+    } else if (vehicleData.actie !== 'delete') {
+      db.vehicles.push(vehicleData);
+      console.log(`Nieuw voertuig toegevoegd: ${vehicleData.id}`);
+    }
+    
+    // Sla op
+    await fs.writeFile(dbPath, JSON.stringify(db, null, 2));
+    
+    return db;
+  } catch (error) {
+    console.error('Database error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Download foto's naar lokale opslag
+ */
+async function downloadPhotos(vehicleData) {
+  if (!vehicleData.fotoUrls || vehicleData.fotoUrls.length === 0) {
+    return [];
+  }
+  
+  const photoDir = path.join(CONFIG.DATA_DIR, 'photos', vehicleData.id);
+  await fs.mkdir(photoDir, { recursive: true });
+  
+  const downloadedPhotos = [];
+  
+  for (let i = 0; i < vehicleData.fotoUrls.length; i++) {
+    const url = vehicleData.fotoUrls[i];
+    const ext = path.extname(new URL(url).pathname) || '.jpg';
+    const filename = `photo_${i + 1}${ext}`;
+    const filepath = path.join(photoDir, filename);
+    
+    try {
+      const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
+      await fs.writeFile(filepath, response.data);
+      downloadedPhotos.push({
+        originalUrl: url,
+        localPath: filepath,
+        filename: filename
+      });
+      console.log(`Foto gedownload: ${filename}`);
+    } catch (error) {
+      console.error(`Foto download mislukt: ${url}`, error.message);
+    }
+  }
+  
+  return downloadedPhotos;
+}
+
+/**
+ * Commit en push naar GitHub
+ */
+async function commitToGitHub(vehicleData) {
+  if (!CONFIG.GITHUB_TOKEN) {
+    console.warn('Geen GITHUB_TOKEN geconfigureerd, sla over');
+    return { skipped: true, reason: 'No GitHub token' };
+  }
+  
+  const repoUrl = `https://${CONFIG.GITHUB_TOKEN}@github.com/${CONFIG.GITHUB_REPO}.git`;
+  const git = simpleGit(CONFIG.REPO_DIR);
+  
+  try {
+    // Zorg dat repo directory bestaat
+    await fs.mkdir(CONFIG.REPO_DIR, { recursive: true });
+    
+    // Check of repo al gecloned is
+    const gitDir = path.join(CONFIG.REPO_DIR, '.git');
+    try {
+      await fs.access(gitDir);
+    } catch {
+      // Clone repo
+      console.log('Cloning repository...');
+      await simpleGit().clone(repoUrl, CONFIG.REPO_DIR);
+    }
+    
+    // Pull latest changes
+    await git.pull('origin', CONFIG.GITHUB_BRANCH);
+    
+    // Kopieer database naar repo
+    const dbSource = path.join(CONFIG.DATA_DIR, 'vehicles.json');
+    const dbTarget = path.join(CONFIG.REPO_DIR, 'data', 'vehicles.json');
+    
+    await fs.mkdir(path.join(CONFIG.REPO_DIR, 'data'), { recursive: true });
+    
+    try {
+      await fs.copyFile(dbSource, dbTarget);
+    } catch (e) {
+      console.warn('Kon database niet kopiëren:', e.message);
+    }
+    
+    // Kopieer foto's
+    const photoSourceDir = path.join(CONFIG.DATA_DIR, 'photos');
+    const photoTargetDir = path.join(CONFIG.REPO_DIR, 'data', 'photos');
+    
+    try {
+      await fs.mkdir(photoTargetDir, { recursive: true });
+      // Hier zou je foto's kunnen kopiëren als dat nodig is
+    } catch (e) {
+      console.warn('Kon foto\'s niet kopiëren:', e.message);
+    }
+    
+    // Check of er changes zijn
+    const status = await git.status();
+    
+    if (status.files.length === 0) {
+      console.log('Geen changes om te committen');
+      return { skipped: true, reason: 'No changes' };
+    }
+    
+    // Commit en push
+    const commitMessage = `VWE Update: ${vehicleData.actie} ${vehicleData.merk} ${vehicleData.model} (${vehicleData.kenteken || vehicleData.id})`;
+    
+    await git.add('.');
+    await git.commit(commitMessage);
+    await git.push('origin', CONFIG.GITHUB_BRANCH);
+    
+    console.log('Changes gecommit en gepushed naar GitHub');
+    
+    return {
+      success: true,
+      commitMessage,
+      filesChanged: status.files.length
+    };
+    
+  } catch (error) {
+    console.error('GitHub commit error:', error);
+    throw error;
+  }
+}
+
+// Main webhook endpoint
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('Webhook ontvangen');
+    console.log('Content-Type:', req.headers['content-type']);
+    console.log('Body length:', req.body ? req.body.length : 0);
+    
+    // Parse XML
+    const xmlData = req.body;
+    if (!xmlData || xmlData.length === 0) {
+      return res.status(400).json({ error: 'Lege body ontvangen' });
+    }
+    
+    const parsedXml = await parseVWEXml(xmlData);
+    console.log('XML parsed successfully');
+    
+    // Extract voertuig data
+    const vehicleData = extractVehicleData(parsedXml);
+    console.log('Voertuig data extracted:', vehicleData.id, vehicleData.merk, vehicleData.model);
+    
+    // Sla op in database
+    await saveVehicle(vehicleData);
+    
+    // Download foto's (optioneel, kan async)
+    downloadPhotos(vehicleData).catch(err => {
+      console.error('Foto download error (non-blocking):', err.message);
+    });
+    
+    // Commit naar GitHub (optioneel, kan async als je snelle response wilt)
+    const gitResult = await commitToGitHub(vehicleData);
+    
+    // Response
+    res.json({
+      success: true,
+      message: 'Webhook verwerkt',
+      vehicle: {
+        id: vehicleData.id,
+        kenteken: vehicleData.kenteken,
+        merk: vehicleData.merk,
+        model: vehicleData.model,
+        actie: vehicleData.actie
+      },
+      gitResult
+    });
+    
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Test endpoint voor JSON data (handig voor debugging)
+app.post('/webhook/json', async (req, res) => {
+  try {
+    const vehicleData = normalizeVehicleData(req.body);
+    await saveVehicle(vehicleData);
+    
+    const gitResult = await commitToGitHub(vehicleData);
+    
+    res.json({
+      success: true,
+      vehicle: vehicleData,
+      gitResult
+    });
+  } catch (error) {
+    console.error('JSON webhook error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// View database endpoint (voor debugging)
+app.get('/vehicles', async (req, res) => {
+  try {
+    const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
+    const data = await fs.readFile(dbPath, 'utf8');
+    res.json(JSON.parse(data));
+  } catch (error) {
+    res.status(404).json({ error: 'Database niet gevonden', vehicles: [] });
+  }
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log('='.repeat(50));
+  console.log('VWE Webhook Server voor Car Store Cuijk');
+  console.log('='.repeat(50));
+  console.log(`Server draait op poort ${PORT}`);
+  console.log(`Webhook URL: http://localhost:${PORT}/webhook`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log('');
+  console.log('Configuratie:');
+  console.log(`  GitHub Repo: ${CONFIG.GITHUB_REPO}`);
+  console.log(`  GitHub Branch: ${CONFIG.GITHUB_BRANCH}`);
+  console.log(`  GitHub Token: ${CONFIG.GITHUB_TOKEN ? '✓ Geconfigureerd' : '✗ Niet geconfigureerd'}`);
+  console.log('');
+  console.log('Environment variables:');
+  console.log('  GITHUB_TOKEN - GitHub personal access token');
+  console.log('  GITHUB_REPO - Repository (default: battletron1337gh/CarStoreCuijk)');
+  console.log('  GITHUB_BRANCH - Branch (default: main)');
+  console.log('  PORT - Server poort (default: 3000)');
+  console.log('='.repeat(50));
+});
+
+module.exports = app;
