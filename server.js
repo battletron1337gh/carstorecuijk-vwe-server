@@ -1,7 +1,13 @@
 /**
  * VWE Webhook Server voor Car Store Cuijk
  * 
- * Ontvangt voertuig data van VWE en commit updates naar GitHub
+ * Ontvangt voertuig data van VWE en:
+ * 1. Slaat op in lokale database
+ * 2. Commit naar GitHub
+ * 
+ * De deploy naar Hostinger gebeurt automatisch via GitHub Actions
+ * zodra er een commit wordt gedaan.
+ * 
  * Deploy: Render.com (gratis tier)
  */
 
@@ -43,14 +49,23 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'VWE Webhook Server',
-    version: '1.0.0',
-    timestamp: new Date().toISOString()
+    version: '2.1.0',
+    timestamp: new Date().toISOString(),
+    features: {
+      github: !!octokit,
+      autoDeploy: 'Via GitHub Actions'
+    }
   });
 });
 
 // Health check voor monitoring
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    github: !!octokit,
+    autoDeploy: 'GitHub Actions → Hostinger'
+  });
 });
 
 // XML Parser
@@ -73,11 +88,9 @@ async function parseVWEXml(xmlData) {
  * Haal voertuig data uit VWE XML
  */
 function extractVehicleData(parsedXml) {
-  // VWE formaat kan variëren, dit zijn veelvoorkomende paden
   const voertuig = parsedXml.voertuig || parsedXml.Voertuig || parsedXml.vehicle || parsedXml.Vehicle;
   
   if (!voertuig) {
-    // Probeer andere mogelijke structuren
     const root = Object.values(parsedXml)[0];
     if (root && typeof root === 'object') {
       return normalizeVehicleData(root);
@@ -94,7 +107,7 @@ function extractVehicleData(parsedXml) {
 function normalizeVehicleData(data) {
   return {
     id: data.id || data.ID || data.voertuigId || data.kenteken || `vehicle_${Date.now()}`,
-    kenteken: data.kenteken || data.kenteken || data.licensePlate || data.license_plate || '',
+    kenteken: data.kenteken || data.licensePlate || data.license_plate || '',
     merk: data.merk || data.make || data.Merk || '',
     model: data.model || data.Model || data.type || data.Type || '',
     bouwjaar: data.bouwjaar || data.year || data.Bouwjaar || data.productiejaar || '',
@@ -115,8 +128,6 @@ function normalizeVehicleData(data) {
  */
 function extractPhotoUrls(data) {
   const urls = [];
-  
-  // Verschillende mogelijke foto velden
   const fotoFields = ['foto', 'fotos', 'photo', 'photos', 'afbeelding', 'afbeeldingen', 'image', 'images'];
   
   for (const field of fotoFields) {
@@ -142,19 +153,16 @@ async function saveVehicle(vehicleData) {
   const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
   
   try {
-    // Zorg dat data directory bestaat
     await fs.mkdir(CONFIG.DATA_DIR, { recursive: true });
     
-    // Lees bestaande database
     let db = { vehicles: [] };
     try {
       const existing = await fs.readFile(dbPath, 'utf8');
       db = JSON.parse(existing);
     } catch (e) {
-      // Bestand bestaat nog niet, start met lege database
+      // Bestand bestaat nog niet
     }
     
-    // Update of voeg toe
     const existingIndex = db.vehicles.findIndex(v => v.id === vehicleData.id || v.kenteken === vehicleData.kenteken);
     
     if (existingIndex >= 0) {
@@ -170,9 +178,7 @@ async function saveVehicle(vehicleData) {
       console.log(`Nieuw voertuig toegevoegd: ${vehicleData.id}`);
     }
     
-    // Sla op
     await fs.writeFile(dbPath, JSON.stringify(db, null, 2));
-    
     return db;
   } catch (error) {
     console.error('Database error:', error);
@@ -202,11 +208,7 @@ async function downloadPhotos(vehicleData) {
     try {
       const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
       await fs.writeFile(filepath, response.data);
-      downloadedPhotos.push({
-        originalUrl: url,
-        localPath: filepath,
-        filename: filename
-      });
+      downloadedPhotos.push({ originalUrl: url, localPath: filepath, filename });
       console.log(`Foto gedownload: ${filename}`);
     } catch (error) {
       console.error(`Foto download mislukt: ${url}`, error.message);
@@ -218,6 +220,7 @@ async function downloadPhotos(vehicleData) {
 
 /**
  * Commit en push naar GitHub via REST API (Octokit)
+ * Dit triggert automatisch GitHub Actions die deployed naar Hostinger
  */
 async function commitToGitHub(vehicleData) {
   if (!CONFIG.GITHUB_TOKEN || !octokit) {
@@ -230,52 +233,40 @@ async function commitToGitHub(vehicleData) {
   const commitMessage = `VWE Update: ${vehicleData.actie} ${vehicleData.merk} ${vehicleData.model} (${vehicleData.kenteken || vehicleData.id})`;
 
   try {
-    // Lees de lokale database
     const dbSource = path.join(CONFIG.DATA_DIR, 'vehicles.json');
     let content;
     try {
       content = await fs.readFile(dbSource, 'utf8');
     } catch (e) {
-      console.warn('Kon database niet lezen:', e.message);
       return { skipped: true, reason: 'No database file' };
     }
 
-    // Base64 encode de content
     const contentBase64 = Buffer.from(content).toString('base64');
 
-    // Haal huidige file op (voor sha)
     let sha = null;
     try {
       const { data: existingFile } = await octokit.repos.getContent({
-        owner,
-        repo,
-        path: filePath,
-        ref: CONFIG.GITHUB_BRANCH
+        owner, repo, path: filePath, ref: CONFIG.GITHUB_BRANCH
       });
       sha = existingFile.sha;
     } catch (e) {
-      // File bestaat nog niet, sha blijft null
       console.log('File bestaat nog niet, wordt aangemaakt');
     }
 
-    // Commit de file
     const { data: commitData } = await octokit.repos.createOrUpdateFileContents({
-      owner,
-      repo,
-      path: filePath,
-      message: commitMessage,
-      content: contentBase64,
-      branch: CONFIG.GITHUB_BRANCH,
-      sha: sha || undefined
+      owner, repo, path: filePath, message: commitMessage,
+      content: contentBase64, branch: CONFIG.GITHUB_BRANCH, sha: sha || undefined
     });
 
     console.log('Changes gecommit naar GitHub:', commitData.commit.sha);
-
-    return {
-      success: true,
-      commitMessage,
-      commitSha: commitData.commit.sha,
-      filePath
+    console.log('GitHub Actions zal nu automatisch deployen naar Hostinger...');
+    
+    return { 
+      success: true, 
+      commitMessage, 
+      commitSha: commitData.commit.sha, 
+      filePath,
+      deployMethod: 'GitHub Actions → Hostinger'
     };
 
   } catch (error) {
@@ -286,17 +277,19 @@ async function commitToGitHub(vehicleData) {
 
 // Main webhook endpoint
 app.post('/webhook', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     console.log('Webhook ontvangen');
     console.log('Content-Type:', req.headers['content-type']);
     console.log('Body length:', req.body ? req.body.length : 0);
     
-    // Parse XML
     const xmlData = req.body;
     if (!xmlData || xmlData.length === 0) {
       return res.status(400).json({ error: 'Lege body ontvangen' });
     }
     
+    // Parse XML
     const parsedXml = await parseVWEXml(xmlData);
     console.log('XML parsed successfully');
     
@@ -307,28 +300,29 @@ app.post('/webhook', async (req, res) => {
     // Sla op in database
     await saveVehicle(vehicleData);
     
-    // Download foto's (optioneel, kan async)
+    // Download foto's (async, non-blocking)
     downloadPhotos(vehicleData).catch(err => {
       console.error('Foto download error (non-blocking):', err.message);
     });
     
-    // Commit naar GitHub (optioneel, kan async als je snelle response wilt)
+    // Commit naar GitHub (triggert automatisch deploy naar Hostinger)
     const gitResult = await commitToGitHub(vehicleData);
+    
+    const duration = Date.now() - startTime;
+    console.log(`Webhook verwerkt in ${duration}ms`);
+    console.log('GitHub Actions zal nu automatisch deployen naar Hostinger...');
     
     // Response - VWE verwacht simpel "1" voor succes
     res.status(200).send('1');
     
   } catch (error) {
     console.error('Webhook error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
+    // VWE verwacht "1" voor succes, ook bij errors (anders blijft VWE het herhalen)
+    res.status(200).send('1');
   }
 });
 
-// Test endpoint voor JSON data (handig voor debugging)
+// Test endpoint voor JSON data
 app.post('/webhook/json', async (req, res) => {
   try {
     const vehicleData = normalizeVehicleData(req.body);
@@ -347,7 +341,7 @@ app.post('/webhook/json', async (req, res) => {
   }
 });
 
-// View database endpoint (voor debugging)
+// View database endpoint
 app.get('/vehicles', async (req, res) => {
   try {
     const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
@@ -366,25 +360,24 @@ app.use((err, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log('='.repeat(50));
+  console.log('='.repeat(60));
   console.log('VWE Webhook Server voor Car Store Cuijk');
-  console.log('='.repeat(50));
+  console.log('='.repeat(60));
   console.log(`Server draait op poort ${PORT}`);
   console.log(`Webhook URL: http://localhost:${PORT}/webhook`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log('');
+  console.log('Workflow:');
+  console.log('  1. VWE stuurt XML webhook');
+  console.log('  2. Server slaat op in database');
+  console.log('  3. Server commit naar GitHub');
+  console.log('  4. GitHub Actions deployed naar Hostinger ✨');
   console.log('');
   console.log('Configuratie:');
   console.log(`  GitHub Repo: ${CONFIG.GITHUB_REPO}`);
   console.log(`  GitHub Branch: ${CONFIG.GITHUB_BRANCH}`);
   console.log(`  GitHub Token: ${CONFIG.GITHUB_TOKEN ? '✓ Geconfigureerd' : '✗ Niet geconfigureerd'}`);
-  console.log(`  GitHub API: ${octokit ? '✓ Actief' : '✗ Niet actief'}`);
-  console.log('');
-  console.log('Environment variables:');
-  console.log('  GITHUB_TOKEN - GitHub personal access token');
-  console.log('  GITHUB_REPO - Repository (default: battletron1337gh/CarStoreCuijk)');
-  console.log('  GITHUB_BRANCH - Branch (default: main)');
-  console.log('  PORT - Server poort (default: 3000)');
-  console.log('='.repeat(50));
+  console.log('='.repeat(60));
 });
 
 module.exports = app;
