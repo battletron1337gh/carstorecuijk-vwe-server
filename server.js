@@ -10,7 +10,7 @@ const xml2js = require('xml2js');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
-const simpleGit = require('simple-git');
+const { Octokit } = require('@octokit/rest');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,9 +21,11 @@ const CONFIG = {
   GITHUB_REPO: process.env.GITHUB_REPO || 'battletron1337gh/CarStoreCuijk',
   GITHUB_BRANCH: process.env.GITHUB_BRANCH || 'main',
   DATA_DIR: process.env.DATA_DIR || './data',
-  REPO_DIR: process.env.REPO_DIR || './repo',
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || null
 };
+
+// Initialiseer Octokit
+const octokit = CONFIG.GITHUB_TOKEN ? new Octokit({ auth: CONFIG.GITHUB_TOKEN }) : null;
 
 // Middleware
 app.use(express.raw({ type: 'application/xml', limit: '10mb' }));
@@ -215,83 +217,70 @@ async function downloadPhotos(vehicleData) {
 }
 
 /**
- * Commit en push naar GitHub
+ * Commit en push naar GitHub via REST API (Octokit)
  */
 async function commitToGitHub(vehicleData) {
-  if (!CONFIG.GITHUB_TOKEN) {
+  if (!CONFIG.GITHUB_TOKEN || !octokit) {
     console.warn('Geen GITHUB_TOKEN geconfigureerd, sla over');
     return { skipped: true, reason: 'No GitHub token' };
   }
-  
-  const repoUrl = `https://${CONFIG.GITHUB_TOKEN}@github.com/${CONFIG.GITHUB_REPO}.git`;
-  const git = simpleGit(CONFIG.REPO_DIR);
-  
+
+  const [owner, repo] = CONFIG.GITHUB_REPO.split('/');
+  const filePath = 'data/vehicles.json';
+  const commitMessage = `VWE Update: ${vehicleData.actie} ${vehicleData.merk} ${vehicleData.model} (${vehicleData.kenteken || vehicleData.id})`;
+
   try {
-    // Zorg dat repo directory bestaat
-    await fs.mkdir(CONFIG.REPO_DIR, { recursive: true });
-    
-    // Check of repo al gecloned is
-    const gitDir = path.join(CONFIG.REPO_DIR, '.git');
-    try {
-      await fs.access(gitDir);
-    } catch {
-      // Clone repo
-      console.log('Cloning repository...');
-      await simpleGit().clone(repoUrl, CONFIG.REPO_DIR);
-    }
-    
-    // Pull latest changes
-    await git.pull('origin', CONFIG.GITHUB_BRANCH);
-    
-    // Kopieer database naar repo
+    // Lees de lokale database
     const dbSource = path.join(CONFIG.DATA_DIR, 'vehicles.json');
-    const dbTarget = path.join(CONFIG.REPO_DIR, 'data', 'vehicles.json');
-    
-    await fs.mkdir(path.join(CONFIG.REPO_DIR, 'data'), { recursive: true });
-    
+    let content;
     try {
-      await fs.copyFile(dbSource, dbTarget);
+      content = await fs.readFile(dbSource, 'utf8');
     } catch (e) {
-      console.warn('Kon database niet kopiëren:', e.message);
+      console.warn('Kon database niet lezen:', e.message);
+      return { skipped: true, reason: 'No database file' };
     }
-    
-    // Kopieer foto's
-    const photoSourceDir = path.join(CONFIG.DATA_DIR, 'photos');
-    const photoTargetDir = path.join(CONFIG.REPO_DIR, 'data', 'photos');
-    
+
+    // Base64 encode de content
+    const contentBase64 = Buffer.from(content).toString('base64');
+
+    // Haal huidige file op (voor sha)
+    let sha = null;
     try {
-      await fs.mkdir(photoTargetDir, { recursive: true });
-      // Hier zou je foto's kunnen kopiëren als dat nodig is
+      const { data: existingFile } = await octokit.repos.getContent({
+        owner,
+        repo,
+        path: filePath,
+        ref: CONFIG.GITHUB_BRANCH
+      });
+      sha = existingFile.sha;
     } catch (e) {
-      console.warn('Kon foto\'s niet kopiëren:', e.message);
+      // File bestaat nog niet, sha blijft null
+      console.log('File bestaat nog niet, wordt aangemaakt');
     }
-    
-    // Check of er changes zijn
-    const status = await git.status();
-    
-    if (status.files.length === 0) {
-      console.log('Geen changes om te committen');
-      return { skipped: true, reason: 'No changes' };
-    }
-    
-    // Commit en push
-    const commitMessage = `VWE Update: ${vehicleData.actie} ${vehicleData.merk} ${vehicleData.model} (${vehicleData.kenteken || vehicleData.id})`;
-    
-    await git.add('.');
-    await git.commit(commitMessage);
-    await git.push('origin', CONFIG.GITHUB_BRANCH);
-    
-    console.log('Changes gecommit en gepushed naar GitHub');
-    
+
+    // Commit de file
+    const { data: commitData } = await octokit.repos.createOrUpdateFileContents({
+      owner,
+      repo,
+      path: filePath,
+      message: commitMessage,
+      content: contentBase64,
+      branch: CONFIG.GITHUB_BRANCH,
+      sha: sha || undefined
+    });
+
+    console.log('Changes gecommit naar GitHub:', commitData.commit.sha);
+
     return {
       success: true,
       commitMessage,
-      filesChanged: status.files.length
+      commitSha: commitData.commit.sha,
+      filePath
     };
-    
+
   } catch (error) {
-    console.error('GitHub commit error:', error);
-    throw error;
+    console.error('GitHub commit error:', error.message);
+    return { success: false, error: error.message };
   }
 }
 
@@ -399,6 +388,7 @@ app.listen(PORT, () => {
   console.log(`  GitHub Repo: ${CONFIG.GITHUB_REPO}`);
   console.log(`  GitHub Branch: ${CONFIG.GITHUB_BRANCH}`);
   console.log(`  GitHub Token: ${CONFIG.GITHUB_TOKEN ? '✓ Geconfigureerd' : '✗ Niet geconfigureerd'}`);
+  console.log(`  GitHub API: ${octokit ? '✓ Actief' : '✗ Niet actief'}`);
   console.log('');
   console.log('Environment variables:');
   console.log('  GITHUB_TOKEN - GitHub personal access token');
