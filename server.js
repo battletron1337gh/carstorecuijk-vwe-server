@@ -315,19 +315,8 @@ app.post('/webhook', async (req, res) => {
     // Commit naar GitHub (optioneel, kan async als je snelle response wilt)
     const gitResult = await commitToGitHub(vehicleData);
     
-    // Response
-    res.json({
-      success: true,
-      message: 'Webhook verwerkt',
-      vehicle: {
-        id: vehicleData.id,
-        kenteken: vehicleData.kenteken,
-        merk: vehicleData.merk,
-        model: vehicleData.model,
-        actie: vehicleData.actie
-      },
-      gitResult
-    });
+    // Response - VWE verwacht simpel "1" voor succes
+    res.status(200).send('1');
     
   } catch (error) {
     console.error('Webhook error:', error);
