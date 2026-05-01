@@ -2,7 +2,7 @@
  * VWE Webhook Server voor Car Store Cuijk
  * 
  * Ontvangt voertuig data van VWE en:
- * 1. Slaat op in lokale database
+ * 1. Slaat op in MongoDB database
  * 2. Download foto's naar public/vwe-fotos/[kenteken]/
  * 3. Commit JSON + foto's naar GitHub
  * 
@@ -18,6 +18,7 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
 const { Octokit } = require('@octokit/rest');
+const { saveVehicle, getVehicles, deleteVehicle } = require('./src/database');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -55,7 +56,8 @@ app.get('/', (req, res) => {
     features: {
       github: !!octokit,
       autoDeploy: 'Via GitHub Actions',
-      photoDownload: true
+      photoDownload: true,
+      database: 'MongoDB Atlas'
     }
   });
 });
@@ -66,7 +68,8 @@ app.get('/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     github: !!octokit,
-    autoDeploy: 'GitHub Actions → Hostinger'
+    autoDeploy: 'GitHub Actions → Hostinger',
+    database: 'MongoDB Atlas'
   });
 });
 
@@ -169,46 +172,6 @@ function extractPhotoUrls(data) {
   }
   
   return urls;
-}
-
-/**
- * Sla voertuig op in JSON database
- */
-async function saveVehicle(vehicleData) {
-  const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
-  
-  try {
-    await fs.mkdir(CONFIG.DATA_DIR, { recursive: true });
-    
-    let db = { vehicles: [] };
-    try {
-      const existing = await fs.readFile(dbPath, 'utf8');
-      db = JSON.parse(existing);
-    } catch (e) {
-      // Bestand bestaat nog niet
-    }
-    
-    const existingIndex = db.vehicles.findIndex(v => v.id === vehicleData.id || v.kenteken === vehicleData.kenteken);
-    
-    if (existingIndex >= 0) {
-      if (vehicleData.actie === 'delete') {
-        db.vehicles.splice(existingIndex, 1);
-        console.log(`Voertuig verwijderd: ${vehicleData.id}`);
-      } else {
-        db.vehicles[existingIndex] = { ...db.vehicles[existingIndex], ...vehicleData };
-        console.log(`Voertuig geupdate: ${vehicleData.id}`);
-      }
-    } else if (vehicleData.actie !== 'delete') {
-      db.vehicles.push(vehicleData);
-      console.log(`Nieuw voertuig toegevoegd: ${vehicleData.id}`);
-    }
-    
-    await fs.writeFile(dbPath, JSON.stringify(db, null, 2));
-    return db;
-  } catch (error) {
-    console.error('Database error:', error);
-    throw error;
-  }
 }
 
 /**
@@ -322,17 +285,13 @@ async function commitToGitHub(vehicleData, downloadedPhotos = []) {
     // Bereid bestanden voor
     const files = [];
 
-    // 1. Voertuigen database
-    const dbSource = path.join(CONFIG.DATA_DIR, 'vehicles.json');
-    try {
-      const dbContent = await fs.readFile(dbSource, 'utf8');
-      files.push({
-        path: 'data/vehicles.json',
-        content: dbContent
-      });
-    } catch (e) {
-      console.log('Geen database file gevonden');
-    }
+    // 1. Voertuigen database (export uit MongoDB)
+    const vehicles = await getVehicles();
+    const dbContent = JSON.stringify({ vehicles }, null, 2);
+    files.push({
+      path: 'data/vehicles.json',
+      content: dbContent
+    });
 
     // 2. Gedownloade foto's
     for (const photo of downloadedPhotos) {
@@ -432,7 +391,7 @@ app.post('/webhook', async (req, res) => {
     const vehicleData = extractVehicleData(parsedXml);
     console.log('Voertuig data extracted:', vehicleData.id, vehicleData.merk, vehicleData.model);
     
-    // Sla op in database
+    // Sla op in MongoDB database
     await saveVehicle(vehicleData);
     
     // Download foto's (blocking - we willen ze mee in de commit)
@@ -479,14 +438,14 @@ app.post('/webhook/json', async (req, res) => {
   }
 });
 
-// View database endpoint
+// View database endpoint - haalt uit MongoDB
 app.get('/vehicles', async (req, res) => {
   try {
-    const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
-    const data = await fs.readFile(dbPath, 'utf8');
-    res.json(JSON.parse(data));
+    const vehicles = await getVehicles();
+    res.json({ vehicles });
   } catch (error) {
-    res.status(404).json({ error: 'Database niet gevonden', vehicles: [] });
+    console.error('Error fetching vehicles:', error);
+    res.status(500).json({ error: 'Database error', vehicles: [] });
   }
 });
 
@@ -507,7 +466,7 @@ app.listen(PORT, () => {
   console.log('');
   console.log('Workflow:');
   console.log('  1. VWE stuurt XML webhook');
-  console.log('  2. Server slaat op in database');
+  console.log('  2. Server slaat op in MongoDB database');
   console.log('  3. Server downloadt foto\'s naar public/vwe-fotos/[kenteken]/');
   console.log('  4. Server commit JSON + foto\'s naar GitHub');
   console.log('  5. GitHub Actions deployed naar Hostinger ✨');
@@ -516,6 +475,7 @@ app.listen(PORT, () => {
   console.log(`  GitHub Repo: ${CONFIG.GITHUB_REPO}`);
   console.log(`  GitHub Branch: ${CONFIG.GITHUB_BRANCH}`);
   console.log(`  GitHub Token: ${CONFIG.GITHUB_TOKEN ? '✓ Geconfigureerd' : '✗ Niet geconfigureerd'}`);
+  console.log(`  Database: MongoDB Atlas`);
   console.log('='.repeat(60));
 });
 
