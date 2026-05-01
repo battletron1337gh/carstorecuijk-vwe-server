@@ -3,7 +3,8 @@
  * 
  * Ontvangt voertuig data van VWE en:
  * 1. Slaat op in lokale database
- * 2. Commit naar GitHub
+ * 2. Download foto's naar public/vwe-fotos/[kenteken]/
+ * 3. Commit JSON + foto's naar GitHub
  * 
  * De deploy naar Hostinger gebeurt automatisch via GitHub Actions
  * zodra er een commit wordt gedaan.
@@ -25,7 +26,7 @@ const PORT = process.env.PORT || 3000;
 const CONFIG = {
   GITHUB_TOKEN: process.env.GITHUB_TOKEN,
   GITHUB_REPO: process.env.GITHUB_REPO || 'battletron1337gh/CarStoreCuijk',
-  GITHUB_BRANCH: process.env.GITHUB_BRANCH || 'main',
+  GITHUB_BRANCH: process.env.GITHUB_BRANCH || 'master',
   DATA_DIR: process.env.DATA_DIR || './data',
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || null
 };
@@ -49,11 +50,12 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'VWE Webhook Server',
-    version: '2.1.0',
+    version: '3.0.0',
     timestamp: new Date().toISOString(),
     features: {
       github: !!octokit,
-      autoDeploy: 'Via GitHub Actions'
+      autoDeploy: 'Via GitHub Actions',
+      photoDownload: true
     }
   });
 });
@@ -125,11 +127,34 @@ function normalizeVehicleData(data) {
 
 /**
  * Extract foto URLs uit voertuig data
+ * Ondersteunt zowel directe URLs als VWE's afbeeldingen.afbeelding structuur
  */
 function extractPhotoUrls(data) {
   const urls = [];
   const fotoFields = ['foto', 'fotos', 'photo', 'photos', 'afbeelding', 'afbeeldingen', 'image', 'images'];
   
+  // Check voor VWE's specifieke afbeeldingen structuur
+  if (data.afbeeldingen && data.afbeeldingen.afbeelding) {
+    const afbeeldingen = Array.isArray(data.afbeeldingen.afbeelding) 
+      ? data.afbeeldingen.afbeelding 
+      : [data.afbeeldingen.afbeelding];
+    
+    afbeeldingen.forEach(foto => {
+      if (typeof foto === 'string' && foto.match(/^https?:\/\//)) {
+        urls.push(foto);
+      } else if (foto.url || foto.Url || foto.URL) {
+        urls.push(foto.url || foto.Url || foto.URL);
+      } else if (foto._) {
+        // Soms zit de URL in een text node
+        const url = foto._.trim();
+        if (url.match(/^https?:\/\//)) {
+          urls.push(url);
+        }
+      }
+    });
+  }
+  
+  // Fallback naar andere velden
   for (const field of fotoFields) {
     if (data[field]) {
       const fotos = Array.isArray(data[field]) ? data[field] : [data[field]];
@@ -188,84 +213,194 @@ async function saveVehicle(vehicleData) {
 
 /**
  * Download foto's naar lokale opslag
+ * Slaat op in public/vwe-fotos/[kenteken]/ structuur
  */
 async function downloadPhotos(vehicleData) {
-  if (!vehicleData.fotoUrls || vehicleData.fotoUrls.length === 0) {
+  // Haal foto URLs uit raw data (VWE structuur)
+  const fotoUrls = [];
+  
+  if (vehicleData.raw && vehicleData.raw.afbeeldingen && vehicleData.raw.afbeeldingen.afbeelding) {
+    const afbeeldingen = Array.isArray(vehicleData.raw.afbeeldingen.afbeelding) 
+      ? vehicleData.raw.afbeeldingen.afbeelding 
+      : [vehicleData.raw.afbeeldingen.afbeelding];
+    
+    afbeeldingen.forEach(foto => {
+      if (typeof foto === 'string' && foto.match(/^https?:\/\//)) {
+        fotoUrls.push(foto);
+      } else if (foto.url || foto.Url || foto.URL) {
+        fotoUrls.push(foto.url || foto.Url || foto.URL);
+      } else if (foto._) {
+        const url = foto._.trim();
+        if (url.match(/^https?:\/\//)) {
+          fotoUrls.push(url);
+        }
+      }
+    });
+  }
+  
+  // Fallback naar vehicleData.fotoUrls
+  if (fotoUrls.length === 0 && vehicleData.fotoUrls && vehicleData.fotoUrls.length > 0) {
+    fotoUrls.push(...vehicleData.fotoUrls);
+  }
+  
+  if (fotoUrls.length === 0) {
+    console.log('Geen foto URLs gevonden voor voertuig:', vehicleData.kenteken || vehicleData.id);
     return [];
   }
   
-  const photoDir = path.join(CONFIG.DATA_DIR, 'photos', vehicleData.id);
-  await fs.mkdir(photoDir, { recursive: true });
+  // Gebruik kenteken als map naam (of ID als fallback)
+  const folderName = vehicleData.kenteken || vehicleData.id;
+  const photoDir = path.join('public', 'vwe-fotos', folderName);
+  
+  try {
+    await fs.mkdir(photoDir, { recursive: true });
+  } catch (error) {
+    console.error('Fout bij maken van foto directory:', error.message);
+    return [];
+  }
   
   const downloadedPhotos = [];
   
-  for (let i = 0; i < vehicleData.fotoUrls.length; i++) {
-    const url = vehicleData.fotoUrls[i];
+  for (let i = 0; i < fotoUrls.length; i++) {
+    const url = fotoUrls[i];
     const ext = path.extname(new URL(url).pathname) || '.jpg';
-    const filename = `photo_${i + 1}${ext}`;
+    const filename = `${i + 1}${ext}`;
     const filepath = path.join(photoDir, filename);
     
     try {
-      const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
+      const response = await axios.get(url, { 
+        responseType: 'arraybuffer', 
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
       await fs.writeFile(filepath, response.data);
-      downloadedPhotos.push({ originalUrl: url, localPath: filepath, filename });
-      console.log(`Foto gedownload: ${filename}`);
+      downloadedPhotos.push({ 
+        originalUrl: url, 
+        localPath: filepath, 
+        filename,
+        relativePath: path.join('public', 'vwe-fotos', folderName, filename)
+      });
+      console.log(`Foto gedownload: ${filepath}`);
     } catch (error) {
       console.error(`Foto download mislukt: ${url}`, error.message);
     }
   }
   
+  console.log(`${downloadedPhotos.length}/${fotoUrls.length} foto's gedownload voor ${folderName}`);
   return downloadedPhotos;
 }
 
 /**
  * Commit en push naar GitHub via REST API (Octokit)
  * Dit triggert automatisch GitHub Actions die deployed naar Hostinger
+ * Commit nu ook de gedownloade foto's
  */
-async function commitToGitHub(vehicleData) {
+async function commitToGitHub(vehicleData, downloadedPhotos = []) {
   if (!CONFIG.GITHUB_TOKEN || !octokit) {
     console.warn('Geen GITHUB_TOKEN geconfigureerd, sla over');
     return { skipped: true, reason: 'No GitHub token' };
   }
 
   const [owner, repo] = CONFIG.GITHUB_REPO.split('/');
-  const filePath = 'data/vehicles.json';
   const commitMessage = `VWE Update: ${vehicleData.actie} ${vehicleData.merk} ${vehicleData.model} (${vehicleData.kenteken || vehicleData.id})`;
 
   try {
+    // Haal huidige commit SHA op voor de branch
+    const { data: refData } = await octokit.git.getRef({
+      owner, repo, ref: `heads/${CONFIG.GITHUB_BRANCH}`
+    });
+    const currentCommitSha = refData.object.sha;
+
+    // Haal huidige tree op
+    const { data: commitData } = await octokit.git.getCommit({
+      owner, repo, commit_sha: currentCommitSha
+    });
+    const currentTreeSha = commitData.tree.sha;
+
+    // Bereid bestanden voor
+    const files = [];
+
+    // 1. Voertuigen database
     const dbSource = path.join(CONFIG.DATA_DIR, 'vehicles.json');
-    let content;
     try {
-      content = await fs.readFile(dbSource, 'utf8');
-    } catch (e) {
-      return { skipped: true, reason: 'No database file' };
-    }
-
-    const contentBase64 = Buffer.from(content).toString('base64');
-
-    let sha = null;
-    try {
-      const { data: existingFile } = await octokit.repos.getContent({
-        owner, repo, path: filePath, ref: CONFIG.GITHUB_BRANCH
+      const dbContent = await fs.readFile(dbSource, 'utf8');
+      files.push({
+        path: 'data/vehicles.json',
+        content: dbContent
       });
-      sha = existingFile.sha;
     } catch (e) {
-      console.log('File bestaat nog niet, wordt aangemaakt');
+      console.log('Geen database file gevonden');
     }
 
-    const { data: commitData } = await octokit.repos.createOrUpdateFileContents({
-      owner, repo, path: filePath, message: commitMessage,
-      content: contentBase64, branch: CONFIG.GITHUB_BRANCH, sha: sha || undefined
+    // 2. Gedownloade foto's
+    for (const photo of downloadedPhotos) {
+      try {
+        const photoContent = await fs.readFile(photo.localPath);
+        files.push({
+          path: photo.relativePath,
+          content: photoContent.toString('base64'),
+          encoding: 'base64'
+        });
+      } catch (e) {
+        console.error(`Fout bij lezen foto voor commit: ${photo.localPath}`, e.message);
+      }
+    }
+
+    if (files.length === 0) {
+      return { skipped: true, reason: 'Geen bestanden om te committen' };
+    }
+
+    // Maak blobs voor alle bestanden
+    const treeItems = [];
+    for (const file of files) {
+      const { data: blobData } = await octokit.git.createBlob({
+        owner, repo, 
+        content: file.content, 
+        encoding: file.encoding || 'utf-8'
+      });
+      
+      treeItems.push({
+        path: file.path,
+        mode: '100644',
+        type: 'blob',
+        sha: blobData.sha
+      });
+    }
+
+    // Maak nieuwe tree
+    const { data: newTree } = await octokit.git.createTree({
+      owner, repo, 
+      base_tree: currentTreeSha, 
+      tree: treeItems
     });
 
-    console.log('Changes gecommit naar GitHub:', commitData.commit.sha);
+    // Maak nieuwe commit
+    const { data: newCommit } = await octokit.git.createCommit({
+      owner, repo,
+      message: commitMessage,
+      tree: newTree.sha,
+      parents: [currentCommitSha]
+    });
+
+    // Update branch reference
+    await octokit.git.updateRef({
+      owner, repo,
+      ref: `heads/${CONFIG.GITHUB_BRANCH}`,
+      sha: newCommit.sha
+    });
+
+    console.log('Changes gecommit naar GitHub:', newCommit.sha);
+    console.log(`- ${files.length} bestand(en) gecommit`);
     console.log('GitHub Actions zal nu automatisch deployen naar Hostinger...');
     
     return { 
       success: true, 
       commitMessage, 
-      commitSha: commitData.commit.sha, 
-      filePath,
+      commitSha: newCommit.sha, 
+      filesCommitted: files.length,
+      photosCommitted: downloadedPhotos.length,
       deployMethod: 'GitHub Actions → Hostinger'
     };
 
@@ -300,13 +435,12 @@ app.post('/webhook', async (req, res) => {
     // Sla op in database
     await saveVehicle(vehicleData);
     
-    // Download foto's (async, non-blocking)
-    downloadPhotos(vehicleData).catch(err => {
-      console.error('Foto download error (non-blocking):', err.message);
-    });
+    // Download foto's (blocking - we willen ze mee in de commit)
+    const downloadedPhotos = await downloadPhotos(vehicleData);
     
     // Commit naar GitHub (triggert automatisch deploy naar Hostinger)
-    const gitResult = await commitToGitHub(vehicleData);
+    // Commit nu ook de gedownloade foto's
+    const gitResult = await commitToGitHub(vehicleData, downloadedPhotos);
     
     const duration = Date.now() - startTime;
     console.log(`Webhook verwerkt in ${duration}ms`);
@@ -328,12 +462,16 @@ app.post('/webhook/json', async (req, res) => {
     const vehicleData = normalizeVehicleData(req.body);
     await saveVehicle(vehicleData);
     
-    const gitResult = await commitToGitHub(vehicleData);
+    // Download foto's
+    const downloadedPhotos = await downloadPhotos(vehicleData);
+    
+    const gitResult = await commitToGitHub(vehicleData, downloadedPhotos);
     
     res.json({
       success: true,
       vehicle: vehicleData,
-      gitResult
+      gitResult,
+      photosDownloaded: downloadedPhotos.length
     });
   } catch (error) {
     console.error('JSON webhook error:', error);
@@ -370,8 +508,9 @@ app.listen(PORT, () => {
   console.log('Workflow:');
   console.log('  1. VWE stuurt XML webhook');
   console.log('  2. Server slaat op in database');
-  console.log('  3. Server commit naar GitHub');
-  console.log('  4. GitHub Actions deployed naar Hostinger ✨');
+  console.log('  3. Server downloadt foto\'s naar public/vwe-fotos/[kenteken]/');
+  console.log('  4. Server commit JSON + foto\'s naar GitHub');
+  console.log('  5. GitHub Actions deployed naar Hostinger ✨');
   console.log('');
   console.log('Configuratie:');
   console.log(`  GitHub Repo: ${CONFIG.GITHUB_REPO}`);
