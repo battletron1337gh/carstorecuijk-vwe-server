@@ -18,6 +18,7 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
 const { Octokit } = require('@octokit/rest');
+const hostinger = require('./src/hostinger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,11 +51,12 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'VWE Webhook Server',
-    version: '3.0.1',
+    version: '3.1.0',
     timestamp: new Date().toISOString(),
     features: {
       github: !!octokit,
-      autoDeploy: 'Via GitHub Actions',
+      hostinger: hostinger.isConfigured(),
+      autoDeploy: hostinger.isConfigured() ? 'Direct SSH → Hostinger' : 'Via GitHub Actions',
       photoDownload: true
     }
   });
@@ -66,7 +68,8 @@ app.get('/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     github: !!octokit,
-    autoDeploy: 'GitHub Actions → Hostinger'
+    hostinger: hostinger.isConfigured(),
+    autoDeploy: hostinger.isConfigured() ? 'Direct SSH → Hostinger' : 'GitHub Actions → Hostinger'
   });
 });
 
@@ -459,16 +462,36 @@ app.post('/webhook', async (req, res) => {
     // Sla op in database
     await saveVehicle(vehicleData);
     
-    // Download foto's (blocking - we willen ze mee in de commit)
+    // Download foto's
     const downloadedPhotos = await downloadPhotos(vehicleData);
     
-    // Commit naar GitHub (triggert automatisch deploy naar Hostinger)
-    // Commit nu ook de gedownloade foto's
-    const gitResult = await commitToGitHub(vehicleData, downloadedPhotos);
+    let deployResult = null;
+    
+    // Upload direct naar Hostinger via SSH (als geconfigureerd)
+    if (hostinger.isConfigured()) {
+      console.log('Uploading direct naar Hostinger via SSH...');
+      
+      // Upload vehicles.json
+      const dbPath = path.join(CONFIG.DATA_DIR, 'vehicles.json');
+      await hostinger.uploadVehiclesJson(dbPath);
+      
+      // Upload foto's
+      for (const photo of downloadedPhotos) {
+        const kenteken = vehicleData.kenteken || vehicleData.id;
+        await hostinger.uploadPhoto(photo.localPath, kenteken, photo.filename);
+      }
+      
+      deployResult = { method: 'Direct SSH → Hostinger', success: true };
+      console.log('✅ Direct upload naar Hostinger voltooid');
+    } else {
+      // Fallback: Commit naar GitHub
+      console.log('Hostinger niet geconfigureerd, gebruik GitHub...');
+      deployResult = await commitToGitHub(vehicleData, downloadedPhotos);
+    }
     
     const duration = Date.now() - startTime;
     console.log(`Webhook verwerkt in ${duration}ms`);
-    console.log('GitHub Actions zal nu automatisch deployen naar Hostinger...');
+    console.log('Deploy methode:', deployResult.method || deployResult.deployMethod || 'GitHub Actions');
     
     // Response - VWE verwacht simpel "1" voor succes
     res.status(200).send('1');
@@ -533,13 +556,18 @@ app.listen(PORT, () => {
   console.log('  1. VWE stuurt XML webhook');
   console.log('  2. Server slaat op in database');
   console.log('  3. Server downloadt foto\'s naar public/vwe-fotos/[kenteken]/');
-  console.log('  4. Server commit JSON + foto\'s naar GitHub');
-  console.log('  5. GitHub Actions deployed naar Hostinger ✨');
+  if (hostinger.isConfigured()) {
+    console.log('  4. Server uploadt direct naar Hostinger via SSH ✨');
+  } else {
+    console.log('  4. Server commit JSON + foto\'s naar GitHub');
+    console.log('  5. GitHub Actions deployed naar Hostinger ✨');
+  }
   console.log('');
   console.log('Configuratie:');
   console.log(`  GitHub Repo: ${CONFIG.GITHUB_REPO}`);
   console.log(`  GitHub Branch: ${CONFIG.GITHUB_BRANCH}`);
   console.log(`  GitHub Token: ${CONFIG.GITHUB_TOKEN ? '✓ Geconfigureerd' : '✗ Niet geconfigureerd'}`);
+  console.log(`  Hostinger SSH: ${hostinger.isConfigured() ? '✓ Geconfigureerd' : '✗ Niet geconfigureerd'}`);
   console.log('='.repeat(60));
 });
 
