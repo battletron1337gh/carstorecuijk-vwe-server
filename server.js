@@ -105,19 +105,43 @@ function extractVehicleData(parsedXml) {
 
 /**
  * Normaliseer voertuig data naar consistent formaat
+ * Ondersteunt VWE's specifieke XML structuur
  */
 function normalizeVehicleData(data) {
+  // Extract prijs uit VWE's geneste structuur: verkoopprijs_particulier.prijzen.prijs.bedrag
+  let prijs = '';
+  if (data.verkoopprijs_particulier && data.verkoopprijs_particulier.prijzen && data.verkoopprijs_particulier.prijzen.prijs) {
+    const prijsData = data.verkoopprijs_particulier.prijzen.prijs;
+    prijs = prijsData.bedrag || prijsData.Bedrag || '';
+  }
+  // Fallback naar andere prijs velden
+  if (!prijs) {
+    prijs = data.prijs || data.price || data.Prijs || data.verkoopprijs || '';
+  }
+
+  // Extract KM stand uit VWE's tellerstand._ structuur
+  let kmStand = '';
+  if (data.tellerstand && data.tellerstand._) {
+    kmStand = data.tellerstand._;
+  } else if (data.tellerstand && typeof data.tellerstand === 'string') {
+    kmStand = data.tellerstand;
+  }
+  // Fallback naar andere km velden
+  if (!kmStand) {
+    kmStand = data.kmStand || data.kilometerstand || data.mileage || data.KmStand || '';
+  }
+
   return {
     id: data.id || data.ID || data.voertuigId || data.kenteken || `vehicle_${Date.now()}`,
     kenteken: data.kenteken || data.licensePlate || data.license_plate || '',
     merk: data.merk || data.make || data.Merk || '',
     model: data.model || data.Model || data.type || data.Type || '',
     bouwjaar: data.bouwjaar || data.year || data.Bouwjaar || data.productiejaar || '',
-    prijs: data.prijs || data.price || data.Prijs || data.verkoopprijs || '',
-    kmStand: data.kmStand || data.kilometerstand || data.mileage || data.KmStand || '',
+    prijs: prijs,
+    kmStand: kmStand,
     brandstof: data.brandstof || data.fuel || data.Brandstof || '',
     transmissie: data.transmissie || data.transmission || data.Transmissie || '',
-    kleur: data.kleur || data.color || data.Kleur || '',
+    kleur: data.basiskleur || data.kleur || data.color || data.Kleur || '',
     fotoUrls: extractPhotoUrls(data),
     actie: data.actie || data.action || data.Actie || 'add',
     timestamp: new Date().toISOString(),
