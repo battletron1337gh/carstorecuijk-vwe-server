@@ -50,7 +50,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'VWE Webhook Server',
-    version: '3.0.0',
+    version: '3.0.1',
     timestamp: new Date().toISOString(),
     features: {
       github: !!octokit,
